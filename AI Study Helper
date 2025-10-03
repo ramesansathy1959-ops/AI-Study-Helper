@@ -1,0 +1,814 @@
+import React, { useState, useEffect, useCallback, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot } from 'firebase/firestore';
+import { Home, MessageSquare, BookOpen, PenTool, Zap, CheckCircle, Loader, User, DollarSign, List, FileText, BarChart, XCircle, CornerDownRight } from 'lucide-react';
+
+// --- FIREBASE INITIALIZATION AND CONTEXT ---
+const AppContext = createContext();
+
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Helper to format currency (for INR)
+const formatCurrency = (amount) => {
+  return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(amount);
+};
+
+// Custom Hook to manage Firebase services and state
+const useFirebase = () => {
+  const [app, setApp] = useState(null);
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [userData, setUserData] = useState({
+    qa_count: 0,
+    essay_count: 0,
+    notes_count: 0,
+    flashcard_count: 0,
+    quiz_count: 0,
+    isPremium: false,
+    lastResetDate: new Date().toISOString().split('T')[0]
+  });
+
+  // 1. Initial Firebase Setup and Authentication
+  useEffect(() => {
+    if (!firebaseConfig) {
+      console.error("Firebase config not available.");
+      setIsAuthReady(true);
+      return;
+    }
+
+    try {
+      const firebaseApp = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(firebaseApp);
+      const firebaseAuth = getAuth(firebaseApp);
+
+      setApp(firebaseApp);
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      // Sign in process
+      const attemptAuth = async () => {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+          } else {
+            await signInAnonymously(firebaseAuth);
+          }
+        } catch (error) {
+          console.error("Firebase authentication failed:", error);
+          await signInAnonymously(firebaseAuth); // Fallback to anonymous
+        }
+      };
+
+      attemptAuth();
+
+      // Auth state observer
+      const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+        if (user) {
+          setUserId(user.uid);
+        } else {
+          setUserId(null);
+        }
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Error initializing Firebase:", e);
+      setIsAuthReady(true);
+    }
+  }, []);
+
+  // 2. Firestore Listener for User Usage Data
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    const usageDocRef = doc(db, `artifacts/${appId}/users/${userId}/usage_data/daily_limits`);
+
+    const unsubscribe = onSnapshot(usageDocRef, (docSnap) => {
+      const today = new Date().toISOString().split('T')[0];
+      const data = docSnap.exists() ? docSnap.data() : {};
+
+      const resetData = {
+        qa_count: 0,
+        essay_count: 0,
+        notes_count: 0,
+        flashcard_count: 0,
+        quiz_count: 0,
+        isPremium: data.isPremium || false, 
+        lastResetDate: today
+      };
+
+      // Check if data needs a daily reset
+      if (data.lastResetDate !== today) {
+        console.log("Resetting daily usage limits.");
+        setDoc(usageDocRef, resetData, { merge: true }).catch(e => console.error("Error resetting usage:", e));
+        setUserData(resetData);
+      } else {
+        // Data is up-to-date
+        setUserData({ ...resetData, ...data });
+      }
+
+    }, (error) => {
+      console.error("Error fetching usage data:", error);
+    });
+
+    return () => unsubscribe();
+  }, [db, userId]);
+
+  return { app, db, auth, userId, isAuthReady, userData, setUserData };
+};
+
+// --- CORE UTILITIES AND COMPONENTS ---
+
+// Component for a styled button
+const StyledButton = ({ onClick, children, disabled = false, className = '' }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    className={`w-full py-3 px-4 bg-indigo-600 text-white font-semibold rounded-xl shadow-lg hover:bg-indigo-700 transition duration-200 disabled:opacity-50 ${className}`}
+  >
+    {children}
+  </button>
+);
+
+// Component for a standard input field (used by generic features)
+const InputField = ({ label, value, onChange, placeholder = '' }) => (
+  <div className="mb-4">
+    <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>
+    <textarea
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      rows={3}
+      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 resize-none"
+    />
+  </div>
+);
+
+// Function to call the simulated Gemini API for generic text generation
+const callGeminiApi = async (featureName, prompt, apiKey) => {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+  const systemPrompt = `Act as an expert ${featureName} tutor for a 14-year-old Indian student. Provide a concise, highly relevant output in English.`;
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ "google_search": {} }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+  };
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json();
+        console.error("API Error:", errorData);
+        throw new Error(`API call failed: ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No result found.";
+    return text;
+
+  } catch (error) {
+    console.error("Fetch failed:", error);
+    throw new Error("Could not connect to AI service.");
+  }
+};
+
+// --- GENERIC TEXT GENERATION FEATURE ---
+
+const TextGenerationFeature = ({ title, icon: Icon, featureKey, promptLabel, placeholder, resultFormat }) => {
+  const { db, userId, userData, setUserData } = useContext(AppContext);
+  const [input, setInput] = useState('');
+  const [result, setResult] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const limit = 3;
+  const count = userData[featureKey];
+  const isPremium = userData.isPremium;
+  const isLimited = !isPremium && count >= limit;
+  const remaining = limit - count;
+
+  const handleUseFeature = useCallback(async () => {
+    if (!input.trim()) { setMessage("Please enter your question or topic."); return; }
+    if (isLimited) { setMessage(`Limit reached. You have used this feature ${limit} times today. Please upgrade to Premium!`); return; }
+
+    setLoading(true); setMessage(''); setResult('');
+
+    const usageDocRef = doc(db, `artifacts/${appId}/users/${userId}/usage_data/daily_limits`);
+    const newCount = count + 1;
+    const updateData = { [featureKey]: newCount };
+
+    try {
+      await setDoc(usageDocRef, updateData, { merge: true });
+      setUserData(prev => ({ ...prev, [featureKey]: newCount }));
+
+      const apiKey = "";
+      const apiResult = await callGeminiApi(title, input, apiKey);
+
+      setResult(apiResult);
+      setMessage(`Usage remaining: ${isPremium ? 'Unlimited' : remaining - 1}`);
+
+    } catch (e) {
+      console.error("Feature execution error:", e);
+      if (!isPremium) {
+        await setDoc(usageDocRef, { [featureKey]: count }, { merge: true });
+        setUserData(prev => ({ ...prev, [featureKey]: count }));
+      }
+      setMessage(`Error: ${e.message}. Please try again.`);
+    } finally {
+      setLoading(false);
+    }
+  }, [input, isLimited, count, isPremium, db, userId, featureKey, setUserData, title, remaining]);
+
+  return (
+    <div className="p-6 bg-white rounded-xl shadow-2xl space-y-6 max-w-2xl mx-auto">
+      <FeatureHeader title={title} icon={Icon} isPremium={isPremium} count={count} limit={limit} remaining={remaining} />
+      <InputField
+        label={promptLabel}
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        placeholder={placeholder}
+      />
+      <StyledButton onClick={handleUseFeature} disabled={loading || (isLimited && !isPremium)}>
+        {loading ? <span className="flex items-center justify-center"><Loader className="w-5 h-5 animate-spin mr-2" /> Generating...</span> : `Generate ${title}`}
+      </StyledButton>
+      {message && <p className={`p-3 rounded-lg text-sm font-medium ${isLimited && !isPremium ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{message}</p>}
+      {result && (
+        <div className="mt-6">
+          <h3 className="text-xl font-semibold mb-3 border-b pb-2 text-indigo-700">{title} Result:</h3>
+          <div className="bg-gray-50 p-4 rounded-lg whitespace-pre-wrap text-gray-800 border border-indigo-200">
+            {resultFormat(result)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const formatText = (text) => text;
+
+// Function to call the Gemini API for structured JSON quiz data
+const callQuizApi = async (topic, numQuestions, apiKey) => {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+  const systemPrompt = `You are a quiz master. Generate a quiz with ${numQuestions} multiple-choice questions based on the user's topic. The quiz must be returned as a single JSON object.`;
+
+  const payload = {
+    contents: [{ parts: [{ text: `Generate a ${numQuestions}-question quiz on the topic: ${topic}` }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          quiz: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                question: { type: "STRING" },
+                options: { type: "ARRAY", items: { type: "STRING" } },
+                correctAnswerIndex: { type: "NUMBER" } // 0-based index of the correct option
+              },
+              propertyOrdering: ["question", "options", "correctAnswerIndex"]
+            }
+          }
+        }
+      }
+    }
+  };
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        throw new Error(`API call failed: ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!jsonText) throw new Error("Received no JSON data from AI.");
+
+    const parsedJson = JSON.parse(jsonText);
+    if (!parsedJson.quiz || !Array.isArray(parsedJson.quiz)) throw new Error("Invalid quiz structure received.");
+
+    return parsedJson.quiz;
+
+  } catch (error) {
+    console.error("Quiz API Fetch/Parse failed:", error);
+    throw new Error(`Quiz generation failed: ${error.message}`);
+  }
+};
+
+const FeatureHeader = ({ title, icon: Icon, isPremium, count, limit, remaining }) => (
+  <>
+    <div className="flex items-center space-x-3 text-indigo-700">
+      <Icon className="w-8 h-8"/>
+      <h2 className="text-3xl font-bold">{title}</h2>
+      {isPremium && <CheckCircle className="w-5 h-5 text-green-500 ml-2" title="Premium Access"/>}
+    </div>
+    <div className="bg-indigo-50 p-4 rounded-lg flex justify-between items-center text-indigo-800">
+      <p className="font-medium text-sm">
+        Status: <span className={`font-bold ${isPremium ? 'text-green-600' : 'text-orange-600'}`}>{isPremium ? 'Premium (Unlimited)' : `Free (${remaining} uses left today)`}</span>
+      </p>
+      <span className="text-xs">Uses today: {count} / {limit}</span>
+    </div>
+  </>
+);
+
+const QuizPage = () => {
+  const { db, userId, userData, setUserData } = useContext(AppContext);
+  const [topic, setTopic] = useState('');
+  const [quizData, setQuizData] = useState(null);
+  const [userAnswers, setUserAnswers] = useState({});
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [showResults, setShowResults] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const featureKey = "quiz_count";
+  const limit = 3;
+  const count = userData[featureKey];
+  const isPremium = userData.isPremium;
+  const isLimited = !isPremium && count >= limit;
+  const numQuestions = isPremium ? 10 : 5;
+  const remaining = limit - count;
+
+  const handleGenerateQuiz = useCallback(async () => {
+    if (!topic.trim()) { setMessage("Please enter a topic for the quiz."); return; }
+    if (isLimited) { setMessage(`Limit reached. You have used this feature ${limit} times today. Please upgrade to Premium!`); return; }
+
+    setLoading(true);
+    setMessage('');
+    setQuizData(null);
+    setUserAnswers({});
+    setCurrentQuestionIndex(0);
+    setShowResults(false);
+
+    // 1. Update usage count in Firestore
+    const usageDocRef = doc(db, `artifacts/${appId}/users/${userId}/usage_data/daily_limits`);
+    const newCount = count + 1;
+    const updateData = { [featureKey]: newCount };
+
+    try {
+      await setDoc(usageDocRef, updateData, { merge: true });
+      setUserData(prev => ({ ...prev, [featureKey]: newCount }));
+
+      // 2. Call the AI for the quiz
+      const apiKey = "";
+      const quiz = await callQuizApi(topic, numQuestions, apiKey);
+
+      setQuizData(quiz);
+      setMessage(`Quiz generated successfully! (${quiz.length} questions).`);
+
+    } catch (e) {
+      console.error("Quiz generation error:", e);
+      // Revert usage count on API failure
+      if (!isPremium) {
+        await setDoc(usageDocRef, { [featureKey]: count }, { merge: true });
+        setUserData(prev => ({ ...prev, [featureKey]: count }));
+      }
+      setMessage(`Error generating quiz: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [topic, isLimited, count, isPremium, db, userId, setUserData, numQuestions]);
+
+  const selectAnswer = (questionIndex, answerIndex) => {
+    setUserAnswers(prev => ({
+      ...prev,
+      [questionIndex]: answerIndex
+    }));
+  };
+
+  const nextQuestion = () => {
+    if (currentQuestionIndex < (quizData.length - 1)) {
+      setCurrentQuestionIndex(prev => prev + 1);
+    } else {
+      // Reached the end, show results
+      setShowResults(true);
+    }
+  };
+
+  const calculateScore = () => {
+    if (!quizData) return { score: 0, total: 0 };
+    let score = 0;
+    quizData.forEach((q, index) => {
+      if (userAnswers[index] === q.correctAnswerIndex) {
+        score += 1;
+      }
+    });
+    return { score, total: quizData.length };
+  };
+
+  const { score, total } = calculateScore();
+  const currentQuestion = quizData ? quizData[currentQuestionIndex] : null;
+
+  // --- RENDERING LOGIC ---
+
+  if (showResults) {
+    return (
+      <QuizResults score={score} total={total} quizData={quizData} userAnswers={userAnswers} reset={() => { setTopic(''); setQuizData(null); setShowResults(false); }} />
+    );
+  }
+
+  if (quizData && currentQuestion) {
+    const isLastQuestion = currentQuestionIndex === total - 1;
+
+    return (
+      <div className="p-6 bg-white rounded-xl shadow-2xl space-y-6 max-w-2xl mx-auto">
+        <h3 className="text-xl font-bold text-indigo-700">Quiz in Progress: Question {currentQuestionIndex + 1} of {total}</h3>
+        <p className="text-lg text-gray-800 font-medium">{currentQuestion.question}</p>
+
+        <div className="space-y-3">
+          {currentQuestion.options.map((option, index) => {
+            const isSelected = userAnswers[currentQuestionIndex] === index;
+            return (
+              <button
+                key={index}
+                onClick={() => selectAnswer(currentQuestionIndex, index)}
+                className={`w-full text-left p-4 rounded-lg border-2 transition duration-150 flex items-center
+                  ${isSelected ? 'bg-indigo-100 border-indigo-600 text-indigo-800 font-semibold shadow-md' : 'bg-gray-50 border-gray-200 hover:bg-gray-100 text-gray-700'}`
+                }
+              >
+                <CornerDownRight className='w-4 h-4 mr-3' />
+                {option}
+              </button>
+            );
+          })}
+        </div>
+
+        <StyledButton
+          onClick={nextQuestion}
+          disabled={userAnswers[currentQuestionIndex] === undefined}
+          className="mt-6"
+        >
+          {isLastQuestion ? 'Submit Quiz & View Score' : 'Next Question'}
+        </StyledButton>
+
+        <p className="text-sm text-gray-500 text-center">Select an answer to proceed.</p>
+      </div>
+    );
+  }
+
+  // Initial Quiz Generation View
+  return (
+    <div className="p-6 bg-white rounded-xl shadow-2xl space-y-6 max-w-2xl mx-auto">
+      <FeatureHeader title="Interactive Quiz Generator" icon={BarChart} isPremium={isPremium} count={count} limit={limit} remaining={remaining} />
+
+      <InputField
+        label="Quiz Topic"
+        value={topic}
+        onChange={(e) => setTopic(e.target.value)}
+        placeholder="E.g., Key battles of World War 2 or Acids and Bases chemistry."
+      />
+      <div className="p-3 bg-yellow-50 text-yellow-800 rounded-lg text-sm font-medium border border-yellow-200">
+        You will receive a **{numQuestions} question** quiz.
+        ({isPremium ? 'Premium benefit: 10 questions' : 'Free user: 5 questions'})
+      </div>
+
+      <StyledButton onClick={handleGenerateQuiz} disabled={loading || (isLimited && !isPremium)}>
+        {loading ? <span className="flex items-center justify-center"><Loader className="w-5 h-5 animate-spin mr-2" /> Generating Quiz...</span> : `Generate Quiz (${numQuestions} Questions)`}
+      </StyledButton>
+
+      {message && <p className={`p-3 rounded-lg text-sm font-medium ${isLimited && !isPremium ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{message}</p>}
+    </div>
+  );
+};
+
+const QuizResults = ({ score, total, quizData, userAnswers, reset }) => {
+  const percentage = Math.round((score / total) * 100);
+  const resultColor = percentage >= 70 ? 'text-green-600 bg-green-50' : percentage >= 50 ? 'text-orange-600 bg-orange-50' : 'text-red-600 bg-red-50';
+
+  return (
+    <div className="p-6 bg-white rounded-xl shadow-2xl space-y-6 max-w-4xl mx-auto">
+      <h2 className="text-4xl font-extrabold text-indigo-700 border-b pb-4">Quiz Results</h2>
+      <div className={`p-6 rounded-xl text-center ${resultColor}`}>
+        <p className="text-xl font-semibold">Your Score:</p>
+        <p className="text-6xl font-extrabold my-2">{score} / {total}</p>
+        <p className="text-2xl font-bold">({percentage}%)</p>
+      </div>
+
+      <StyledButton onClick={reset} className="!bg-indigo-500 hover:!bg-indigo-600">
+        Generate a New Quiz
+      </StyledButton>
+
+      <h3 className="text-2xl font-bold mt-8 text-gray-800">Review Answers</h3>
+      <div className="space-y-8">
+        {quizData.map((q, qIndex) => {
+          const userAnswerIndex = userAnswers[qIndex];
+          const isCorrect = userAnswerIndex === q.correctAnswerIndex;
+          const userOptionText = userAnswerIndex !== undefined ? q.options[userAnswerIndex] : 'Not Answered';
+          const correctOptionText = q.options[q.correctAnswerIndex];
+
+          return (
+            <div key={qIndex} className={`p-4 rounded-lg border-l-4 ${isCorrect ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}`}>
+              <p className="font-semibold text-gray-900 mb-2">Q{qIndex + 1}: {q.question}</p>
+              <p className="text-sm text-gray-700 mb-1">
+                Your Answer: <span className={`font-bold ${isCorrect ? 'text-green-700' : 'text-red-700'}`}>{userOptionText}</span>
+              </p>
+              {!isCorrect && (
+                <p className="text-sm text-gray-700">
+                  Correct Answer: <span className="font-bold text-green-700">{correctOptionText}</span>
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+
+// --- GENERAL PAGES ---
+
+const HomePage = ({ navigate }) => (
+  <div className="p-6 text-center max-w-2xl mx-auto">
+    <h1 className="text-4xl font-extrabold text-indigo-800 mb-2">AI Study Helper</h1>
+    <p className="text-lg text-gray-600 mb-10">Your all-in-one AI study companion for students in Pune.</p>
+
+    <div className="grid grid-cols-2 gap-6 md:grid-cols-3">
+      <Card
+        icon={MessageSquare}
+        title="Q&A Solver"
+        description="Instant answers to textbook questions."
+        onClick={() => navigate('qa')}
+      />
+      <Card
+        icon={FileText}
+        title="Essay Writer"
+        description="Draft structured essays on any topic."
+        onClick={() => navigate('essay')}
+      />
+      <Card
+        icon={PenTool}
+        title="Study Notes"
+        description="Convert textbook chapters into crisp notes."
+        onClick={() => navigate('notes')}
+      />
+      <Card
+        icon={List}
+        title="Flashcards"
+        description="Generate flashcards from your text."
+        onClick={() => navigate('flashcard')}
+      />
+      <Card
+        icon={BarChart}
+        title="Quiz Generator"
+        description="Create practice quizzes for revision."
+        onClick={() => navigate('quiz')}
+      />
+      <Card
+        icon={DollarSign}
+        title="Premium Plan"
+        description="Unlock unlimited features today!"
+        onClick={() => navigate('premium')}
+        className="bg-yellow-50 border-yellow-300 hover:shadow-yellow-300"
+      />
+    </div>
+
+    <div className="mt-10 pt-6 border-t border-gray-200">
+      <p className="text-sm text-gray-500">
+        All features powered by Google's Gemini AI. Start learning smarter!
+      </p>
+    </div>
+  </div>
+);
+
+const Card = ({ icon: Icon, title, description, onClick, className = '' }) => (
+  <div
+    className={`bg-white border border-indigo-200 p-4 rounded-xl shadow-md hover:shadow-indigo-300 transition duration-300 transform hover:scale-[1.02] cursor-pointer ${className}`}
+    onClick={onClick}
+  >
+    <Icon className="w-8 h-8 text-indigo-600 mb-3 mx-auto" />
+    <h3 className="text-lg font-bold text-gray-800">{title}</h3>
+    <p className="text-xs text-gray-500 mt-1">{description}</p>
+  </div>
+);
+
+const PremiumPage = ({ navigate }) => {
+  const { userData, userId, db } = useContext(AppContext);
+  const isPremium = userData.isPremium;
+  const upgradeCost = 200; // INR
+
+  const handleUpgrade = async () => {
+    if (!userId || !db) {
+        // IMPORTANT: Using custom modal/alert for visibility
+        console.warn("Authentication not ready. Please wait.");
+        // Simulated custom alert (since window.alert is disallowed)
+        alert("Authentication not ready. Please wait.");
+        return;
+    }
+
+    // --- Simulated Payment Process (Using console/native dialog for simulation purposes) ---
+    // NOTE: In a production environment, this would be a UI modal. Using confirm() here only for simulation context.
+    const confirmed = window.confirm(`Confirm upgrade to Premium for ${formatCurrency(upgradeCost)}/month? (Simulation)`);
+
+    if (confirmed) {
+        const usageDocRef = doc(db, `artifacts/${appId}/users/${userId}/usage_data/daily_limits`);
+        const now = new Date();
+        const expiryDate = new Date(now.setMonth(now.getMonth() + 1)).toISOString().split('T')[0];
+
+        try {
+            await setDoc(usageDocRef, {
+                isPremium: true,
+                premiumExpiry: expiryDate,
+                // Resetting counts is a good user experience on upgrade
+                qa_count: 0, essay_count: 0, notes_count: 0, flashcard_count: 0, quiz_count: 0,
+            }, { merge: true });
+
+            // Simulated success message
+            alert("🎉 Premium Activated! You now have UNLIMITED feature access.");
+            navigate('home');
+        } catch (e) {
+            console.error("Error setting premium status:", e);
+            // Simulated error message
+            alert("Upgrade failed. Please check the console for errors.");
+        }
+    }
+  };
+  
+  // Custom alert placeholder function (replace with a real modal in a full application)
+  const alert = (message) => {
+    console.log(`[ALERT/MODAL]: ${message}`);
+    // In a real React app, this would trigger a state change to show a modal component.
+    // Since we can't use window.alert(), we rely on console feedback and simple logic flow.
+  }
+
+  return (
+    <div className="p-6 max-w-xl mx-auto">
+      <div className="bg-indigo-700 text-white p-6 rounded-t-2xl">
+        <h2 className="text-3xl font-bold mb-2 flex items-center"><Zap className="w-6 h-6 mr-2" /> Go Premium</h2>
+        <p className="text-indigo-200">Unlock your full potential with unlimited AI power.</p>
+      </div>
+
+      <div className="bg-white p-6 rounded-b-2xl shadow-2xl">
+        <div className="text-4xl font-extrabold text-indigo-700 my-4">{formatCurrency(upgradeCost)}<span className="text-xl font-normal text-gray-500">/ month</span></div>
+
+        <ul className="space-y-3 text-gray-700 mb-8">
+          <li className="flex items-center"><CheckCircle className="w-5 h-5 text-green-500 mr-2" /> Unlimited Q&A Solver uses</li>
+          <li className="flex items-center"><CheckCircle className="w-5 h-5 text-green-500 mr-2" /> Unlimited Essay and Notes generation</li>
+          <li className="flex items-center"><CheckCircle className="w-5 h-5 text-green-500 mr-2" /> Unlimited Flashcard and Quiz creation</li>
+          <li className="flex items-center"><XCircle className="w-5 h-5 text-red-500 mr-2" /> NO more daily limits (3 uses/day)</li>
+        </ul>
+
+        {isPremium ? (
+          <div className="bg-green-100 text-green-700 p-4 rounded-xl font-semibold text-center">
+            You are currently a Premium Member!
+          </div>
+        ) : (
+          <StyledButton onClick={handleUpgrade}>
+            Activate Premium Now
+          </StyledButton>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// --- MAIN APP COMPONENT ---
+
+const App = () => {
+  const firebaseData = useFirebase();
+  const [currentPage, setCurrentPage] = useState('home');
+
+  const { isAuthReady, userId } = firebaseData;
+
+  const navigate = useCallback((page) => {
+    setCurrentPage(page);
+  }, []);
+
+  const renderPage = () => {
+    if (!isAuthReady) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-[50vh] text-indigo-600">
+          <Loader className="w-8 h-8 animate-spin mb-4" />
+          <p className="text-lg">Initializing app and securing user session...</p>
+        </div>
+      );
+    }
+
+    if (!userId) {
+      return <div className="text-center p-10 text-red-500">Authentication Error. Please refresh.</div>;
+    }
+
+    switch (currentPage) {
+      case 'home':
+        return <HomePage navigate={navigate} />;
+      case 'qa':
+        return (
+          <TextGenerationFeature
+            title="Q&A Solver"
+            icon={MessageSquare}
+            featureKey="qa_count"
+            promptLabel="Your Question"
+            placeholder="E.g., What are the causes of the French Revolution?"
+            resultFormat={formatText}
+          />
+        );
+      case 'essay':
+        return (
+          <TextGenerationFeature
+            title="Essay Writer"
+            icon={FileText}
+            featureKey="essay_count"
+            promptLabel="Essay Topic"
+            placeholder="E.g., Write a 500-word essay on the importance of renewable energy in India."
+            resultFormat={formatText}
+          />
+        );
+      case 'notes':
+        return (
+          <TextGenerationFeature
+            title="Study Notes"
+            icon={PenTool}
+            featureKey="notes_count"
+            promptLabel="Topic/Text for Notes"
+            placeholder="E.g., Summarize the chapter on 'Human Digestive System' into concise notes."
+            resultFormat={formatText}
+          />
+        );
+      case 'flashcard':
+        return (
+          <TextGenerationFeature
+            title="Flashcard Generator"
+            icon={List}
+            featureKey="flashcard_count"
+            promptLabel="Topic for Flashcards"
+            placeholder="E.g., Generate 10 flashcards about the periodic table elements."
+            resultFormat={formatText}
+          />
+        );
+      case 'quiz':
+        return <QuizPage navigate={navigate} />;
+      case 'premium':
+        return <PremiumPage navigate={navigate} />;
+      default:
+        return <HomePage navigate={navigate} />;
+    }
+  };
+
+  return (
+    <AppContext.Provider value={firebaseData}>
+      <div className="min-h-screen bg-gray-100 font-sans">
+        {/* Header/Navigation */}
+        <header className="sticky top-0 bg-white shadow-md z-10">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <div className="flex items-center space-x-2 text-indigo-600 font-extrabold text-2xl cursor-pointer" onClick={() => navigate('home')}>
+              <BookOpen className="w-6 h-6" />
+              <span>AI Study Helper</span>
+            </div>
+
+            <nav className="flex items-center space-x-4">
+                <button
+                    onClick={() => navigate('premium')}
+                    className="flex items-center px-3 py-1 text-sm font-semibold bg-yellow-400 text-indigo-900 rounded-full hover:bg-yellow-500 transition duration-150"
+                >
+                    <Zap className="w-4 h-4 mr-1" />
+                    Premium
+                </button>
+                <div className="flex items-center space-x-2 text-gray-600 text-sm">
+                  <User className="w-5 h-5" />
+                  <span title={userId}>
+                    {userId ? `User ID: ${userId.substring(0, 8)}...` : 'Loading User...'}
+                  </span>
+                </div>
+            </nav>
+          </div>
+        </header>
+
+        {/* Main Content Area */}
+        <main className="py-10">
+          {renderPage()}
+        </main>
+
+        {/* Floating Home Button */}
+        {currentPage !== 'home' && (
+            <button
+                onClick={() => navigate('home')}
+                className="fixed bottom-6 right-6 p-4 bg-indigo-600 text-white rounded-full shadow-xl hover:bg-indigo-700 transition duration-300 transform hover:scale-105"
+                title="Go to Home"
+            >
+                <Home className="w-6 h-6" />
+            </button>
+        )}
+      </div>
+    </AppContext.Provider>
+  );
+};
