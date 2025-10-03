@@ -1,0 +1,19 @@
+{
+  "appId": "com.aistudyhelper.app",
+  "appName": "AI Study Helper",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "npmClient": "npm",
+  "server": {
+    "url": "http://localhost:3000",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 0
+    }
+  }
+}
